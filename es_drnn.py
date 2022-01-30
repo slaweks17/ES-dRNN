@@ -1,7 +1,7 @@
 """
 Created in Sep, 2021, this github version in Jan 2022.
 @author: Slawek Smyl
-internal version no: 23
+internal version no: 23, for the new test set (with nulls)
 
 The program is meant to save forecasts to a database. Table creation, query and export scripts are listed at the end of this file.
 If using ODBC, you also need to create DSN=slawek
@@ -88,7 +88,7 @@ DEBUG_AUTOGRAD_ANOMALIES=False
 torch.autograd.set_detect_anomaly(DEBUG_AUTOGRAD_ANOMALIES)
 
 #    23 embed=4 S2 100,40 [2,7],[4] [0.49,0.035,0.96] LR=3e-3 {5,/3, 6,/10, 7/30} batch=2 {4:5}
-RUN='23 S2 100,40 [2,7],[4] [0.485,0.035,0.96] LR=3e-3 {5,/3, 6,/10, 7/30} batch=2 {4:5}'
+RUN='23 S2 100,40 [2,7],[4] [0.49,0.035,0.96] LR=3e-3 {5,/3, 6,/10, 7/30} batch=2 {4:5}'
 RUN_SHORT="23" #this will be the subdirectory where to save forecasts if USE_DB==False
 #warming steps are needed only for validation/testing, not in training
 
@@ -132,7 +132,7 @@ DATES_EMBED_SIZE=4
 OUTPUT_WINDOW=24 
 INPUT_SIZE=INPUT_WINDOW+DATES_EMBED_SIZE+1+OUTPUT_WINDOW #+log(normalizer)+seasonality 
 QUANTS=[0.5,0.05,0.95]
-TRAINING_QUANTS=[0.485,0.035,0.96]
+TRAINING_QUANTS=[0.49,0.035,0.96]
 INITIAL_BATCH_SIZE=2 
 BATCH_SIZES={4:5} #at which epoch to change it to what
 LEARNING_RATES={5:INITIAL_LEARNING_RATE/3, 6:INITIAL_LEARNING_RATE/10, 7:INITIAL_LEARNING_RATE/30}  #
@@ -196,7 +196,7 @@ train_df.head(3)
 assert len(trainDates)==len(train_df)
 sum(np.isnan(train_df)) #595
 
-DATA_PATH=DATA_DIR+'MHL_test.csv'
+DATA_PATH=DATA_DIR+'MHL_test.csv'  #new test
 test_df=pd.read_csv(DATA_PATH, header=None)
 test_df.shape #(8760, 35)
 test_df.head(3) 
@@ -562,8 +562,11 @@ class DilatedSparseRnnStack(torch.nn.Module):
     
                 
             
-#pinball. Inputs are normalized. Returns list [TRAINING_QUANTS] of tensor[batchSize]
-def trainingLossFunc(forec_t, actuals_t): 
+#pinball
+#forec_t= output of NN
+#actuals_t are the original (although potentially shifted) actuals
+#output list(NUM_OF_QANTS) of batchSize
+def trainingLossFunc(forec_t, actuals_t, anchorLevel):
   if forec_t.shape[0] != actuals_t.shape[0]:
     trouble("forec_t.shape[0] != actuals_t.shape[0]")
 
@@ -575,13 +578,31 @@ def trainingLossFunc(forec_t, actuals_t):
    
   ret=[]
 
+  nans=torch.isnan(actuals_t).detach() | (actuals_t<=0).detach()
+  notNans=(~nans).float()
+  numOfNotNans=notNans.sum(dim=1)
+
+  if torch.any(nans):
+    actuals_t[nans]=1 #actuals have been cloned outside of this function
+
+  #we do it here, becasue Pytorch is alergic to any opearation including nans, even if removed from the graph later
+  #so we first patch nans and execute normalization and squashing and then remove results involving nans
+  actualsS_t=actuals_t/anchorLevel
+
   lower=0; iq=0
   for iq in range(len(TRAINING_QUANTS)):
     quant=TRAINING_QUANTS[iq]
     upper=lower+OUTPUT_WINDOW
-    diff=actuals_t-forec_t[:,lower:upper] 
+    diff=actualsS_t-forec_t[:,lower:upper] #normalized and squashed
     rs=torch.max(diff*quant, diff*(quant-1))
-    rc=rs.mean(dim=1)
+    rs[nans] = 0
+
+    if torch.any(numOfNotNans==0):
+      for ib in range(len(numOfNotNans)):
+        if numOfNotNans[ib]==0:
+          numOfNotNans[ib]+=1
+
+    rc=rs.sum(dim=1)/numOfNotNans #numOfNotNans is vector
     
     if iq==0:
       ret.append(rc)
@@ -612,10 +633,10 @@ def validationLossFunc(forec, actuals, maseNormalizer):
   
   #center
   diff=forec[:,0:OUTPUT_WINDOW]-actuals
-  rmse=np.sqrt(np.mean(diff*diff, axis=1))
-  mase=np.mean(abs(diff), axis=1)/maseNormalizer
-  mape=np.mean(abs(diff/actuals), axis=1)
-  bias=np.mean(diff/actuals, axis=1)
+  rmse=np.sqrt(np.nanmean(diff*diff, axis=1))
+  mase=np.nanmean(abs(diff), axis=1)/maseNormalizer
+  mape=np.nanmean(abs(diff/actuals), axis=1)
+  bias=np.nanmean(diff/actuals, axis=1)
   
   ret[:,0]=rmse
   ret[:,1]=bias
@@ -635,7 +656,7 @@ def validationLossFunc(forec, actuals, maseNormalizer):
     else:
       xceeded=diff<0
         
-    exceeded=np.mean(xceeded, axis=1) 
+    exceeded=np.nanmean(xceeded, axis=1) 
     ret[:,iq+4]=exceeded
     lower=upper
       
@@ -800,8 +821,12 @@ if __name__ == '__main__' or __name__ == 'builtins':
         levels=[]; seasonality=ppBatch.initialSeasonality.copy()
         levSm=torch.sigmoid(torch.stack([perSeriesParams[x].initLevSm for x in batch])).view([ppBatch.batchSize,1])
         sSm=torch.sigmoid(torch.stack([perSeriesParams[x].initSSm for x in batch])).view([ppBatch.batchSize,1])
+        y_l=[]
         for ii in range(INPUT_WINDOW):
           newY=ppBatch.y[:,ii].view([ppBatch.batchSize,1])
+          assert torch.isnan(newY).sum()==0
+          y_l.append(newY)    
+
           if ii==0:
             newLevel=newY/seasonality[0]
           else:
@@ -822,6 +847,15 @@ if __name__ == '__main__' or __name__ == 'builtins':
             ii=istep+1-STEP_SIZE
             for ii in range(istep+1-STEP_SIZE, istep+1):
               newY=ppBatch.y[:,ii].view([ppBatch.batchSize,1])
+              if torch.isnan(newY).sum()>0:
+                newY=newY.clone()
+                for ib in range(ppBatch.batchSize):
+                  if torch.isnan(newY[ib]):
+                    assert ii-SEASONALITY>=0
+                    newY[ib]=ppBatch.y[ib,ii-SEASONALITY]
+              assert torch.isnan(newY).sum()==0
+              y_l.append(newY)    
+                  
               newLevel=levSm*newY/seasonality[ii]+(1-levSm)*levels[ii-1]
               levels.append(newLevel)
               
@@ -830,7 +864,7 @@ if __name__ == '__main__' or __name__ == 'builtins':
             
           encodedDate0_t=datesToMetadata(dat).repeat(ppBatch.batchSize,1)
           encodedDate_t=embed(encodedDate0_t)
-          x0_t=ppBatch.y[:,istep-INPUT_WINDOW+1:istep+1] #x0_t.shape
+          x0_t=torch.cat(y_l[istep-INPUT_WINDOW+1:istep+1], dim=1)
           anchorLevel=torch.mean(x0_t, dim=1).view([ppBatch.batchSize,1])
           inputSeasonality_t=torch.cat(seasonality[istep-INPUT_WINDOW+1:istep+1],dim=1)  #inputSeasonality_t.shape
           x_t=torch.log(x0_t/(inputSeasonality_t*anchorLevel))
@@ -856,10 +890,12 @@ if __name__ == '__main__' or __name__ == 'builtins':
           sSm=torch.sigmoid(forec0_t[:,1]+S_SM0).view([ppBatch.batchSize,1])
           
           if isTraining:  
-            actuals_t=ppBatch.y[:,istep+1:istep+OUTPUT_WINDOW+1]/anchorLevel
+            actuals_t=ppBatch.y[:,istep+1:istep+OUTPUT_WINDOW+1].clone()
             forec_t=torch.exp(forec0_t[:,2:])*outputSeasonality.repeat(1,NUM_OF_QUANTS) #outputSeasonality.shape
-            loss_lt=trainingLossFunc(forec_t, actuals_t)
-            trainingErrors.append(torch.unsqueeze(torch.sum(torch.cat(loss_lt)), dim=0)/ppBatch.batchSize)
+            loss_lt=trainingLossFunc(forec_t, actuals_t, anchorLevel)
+            avgLoss=torch.nanmean(torch.cat(loss_lt))
+            if not torch.isnan(avgLoss):
+              trainingErrors.append(torch.unsqueeze(avgLoss,dim=0))
             for iq in range(NUM_OF_QUANTS):
               trainingQErrors[iq].append(loss_lt[iq].detach().numpy())   
                
@@ -868,6 +904,7 @@ if __name__ == '__main__' or __name__ == 'builtins':
           trainer.zero_grad()  
             
           avgTrainLoss_t=torch.mean(torch.cat(trainingErrors))    
+          assert not torch.isnan(avgTrainLoss_t)  
           avgTrainLoss_t.backward()          
           trainer.step()    
           
@@ -913,6 +950,14 @@ if __name__ == '__main__' or __name__ == 'builtins':
               if istep>=INPUT_WINDOW:
                 for ii in range(istep+1-STEP_SIZE, istep+1):
                   newY=ppBatch.y[:,ii].view([ppBatch.batchSize,1])
+                  if torch.isnan(newY).sum()>0:
+                    for ib in range(ppBatch.batchSize):
+                      if torch.isnan(newY[ib]):
+                        assert ii-SEASONALITY>=0
+                        newY[ib]=ppBatch.y[ib,ii-SEASONALITY]
+                        ppBatch.y[ib,ii]=newY[ib] #patching input, not output. No gradient needed, so we can overwrite
+                  assert torch.isnan(newY).sum()==0
+                        
                   newLevel=levSm*newY/seasonality[ii]+(1-levSm)*levels[ii-1]
                   levels.append(newLevel)
                   
