@@ -88,7 +88,7 @@ DEBUG_AUTOGRAD_ANOMALIES=False
 torch.autograd.set_detect_anomaly(DEBUG_AUTOGRAD_ANOMALIES)
 
 #    23 embed=4 S2 100,40 [2,7],[4] [0.49,0.035,0.96] LR=3e-3 {5,/3, 6,/10, 7/30} batch=2 {4:5}
-RUN='23 S2 100,40 [2,7],[4] [0.49,0.035,0.96] LR=3e-3 {5,/3, 6,/10, 7/30} batch=2 {4:5}'
+RUN='23 PER_SERIES_MULTIP=10 S2 100,40 [2,7],[4] [0.49,0.035,0.96] LR=3e-3 {5,/3, 6,/10, 7/30} batch=2 {4:5}'
 RUN_SHORT="23" #this will be the subdirectory where to save forecasts if USE_DB==False
 #warming steps are needed only for validation/testing, not in training
 
@@ -111,6 +111,7 @@ SAVE_TEST_EVERY_STEP=1
 PI_WEIGHT=0.3
 INITIAL_LEARNING_RATE=3e-3
 NUM_OF_TRAINING_STEPS=50
+PER_SERIES_MULTIP=10
 
 STEP_SIZE=24
 SEASONALITY_IN_DAYS=7
@@ -729,7 +730,7 @@ if __name__ == '__main__' or __name__ == 'builtins':
   for series in series_list:
     perSerPars=PerSeriesParams(series)
     perSeriesParams.append(perSerPars)
-    perSerTrainer=torch.optim.Adam(perSerPars.parameters(), lr=INITIAL_LEARNING_RATE)
+    perSerTrainer=torch.optim.Adam(perSerPars.parameters(), lr=INITIAL_LEARNING_RATE*PER_SERIES_MULTIP)
     perSeriesTrainers.append(perSerTrainer)
     
   embed=torch.nn.Linear(DATES_ENCODE_SIZE, DATES_EMBED_SIZE)
@@ -769,7 +770,7 @@ if __name__ == '__main__' or __name__ == 'builtins':
           param_group['lr']=learningRate     
       for series in series_list: 
         for param_group in perSeriesTrainers[series].param_groups:
-          param_group['lr']=learningRate
+          param_group['lr']=learningRate*PER_SERIES_MULTIP
       print('changin LR to:', f'{learningRate:.2}' )   
       
     epochTrainingErrors=[];
@@ -902,6 +903,8 @@ if __name__ == '__main__' or __name__ == 'builtins':
         #batch level     
         if len(trainingErrors)>0:
           trainer.zero_grad()  
+          for series in ppBatch.series:
+            perSeriesTrainers[series].zero_grad()
             
           avgTrainLoss_t=torch.mean(torch.cat(trainingErrors))    
           assert not torch.isnan(avgTrainLoss_t)  
